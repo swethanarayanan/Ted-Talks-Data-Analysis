@@ -1,0 +1,346 @@
+---
+title: "Assignment4"
+author: "Swetha Narayanan"
+date: "10/18/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+```
+
+## Problem Statement
+In this project, we want to use text mining techniques, such as sentiment analysis, text classification and topic modelling to understand content in a text dataset
+
+## Set seed and Load libraries
+```{r}
+set.seed(5152)
+library(parallel)
+library(doParallel)
+library(tm)
+library(caret)
+library(plyr)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(jsonlite)
+library(corrplot)
+library(topicmodels)
+library(tidytext)
+library(tibble)
+library(text2vec)
+library(tidyr)
+library(performanceEstimation)
+library(lsa)
+library(RColorBrewer)
+library(gplots)
+library(ranger)
+require("tm.lexicon.GeneralInquirer")
+```
+
+## Data load
+```{r}
+ted_main <- read.csv("ted_main.csv")
+nrow(ted_main)
+transcripts <- read.csv("transcripts.csv")
+nrow(transcripts)
+transcripts<- unique(transcripts)
+nrow(transcripts)
+transcripts <- transcripts[,c("transcript","url")]
+
+ted_merged <- merge(ted_main, transcripts, by = "url")
+nrow(ted_merged)
+ted_merged$transcript <- iconv(ted_merged$transcript,"WINDOWS-1252","UTF-8")
+ted_merged$id <- seq.int(nrow(ted_merged)) #id to maintain sequence
+```
+
+## Enable parallel analysis
+```{r}
+# Create cluster to run R in parallel; best to use total number of CPU - 1
+cl <- makePSOCKcluster(detectCores() - 1)
+
+# Allow libraries such as doParallel and tm to access the cluster
+registerDoParallel(cl)
+tm_parLapply_engine(cl)
+#gc() - perform gc from time to time
+```
+
+## Task #1 : Data pre-processing of textual transcript data
+```{r}
+transcript_corpus <- VCorpus(VectorSource(ted_merged$transcript))
+transcript_corpus <- tm_map(transcript_corpus, content_transformer(tolower))
+transcript_corpus <- tm_map(transcript_corpus, content_transformer(gsub), pattern="\\W",replace=" ") # remove emojis
+transcript_corpus <- tm_map(transcript_corpus, removeNumbers) # remove numbers
+transcript_corpus <- tm_map(transcript_corpus, removeWords, stopwords()) # remove stop words
+transcript_corpus <- tm_map(transcript_corpus, removePunctuation) # remove punctuation
+transcript_corpus <- tm_map(transcript_corpus, stemDocument)
+conv2space <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+transcript_corpus <- tm_map(transcript_corpus, conv2space, "/")
+transcript_corpus <- tm_map(transcript_corpus, conv2space, "@")
+transcript_corpus <- tm_map(transcript_corpus, conv2space, "!")
+transcript_corpus <- tm_map(transcript_corpus, stripWhitespace) # eliminate unneeded whitespace
+```
+
+## Task #2 :Text Analysis using dictionary Approach
+We can determine the emotions that are associated with the talks by counting the occurrences of the emotions terms.
+Then we create heatmap with one axis as emotions and the other as the talks. The colour of the heatmap will show the count of the emotions. We can expect it to be very dense and you might not want to show the label for the talks.
+This visualisation basically helps us to understand what kind of emotions are in the talks.
+```{r}
+
+#Approach : using tm_term_score
+tf_dtm = DocumentTermMatrix(transcript_corpus, control = list(weighting = weightTf))
+freq_terms <- findFreqTerms(tf_dtm, lowfreq = 50)
+tf_dtm <- DocumentTermMatrix(transcript_corpus, control = list(dictionary = freq_terms, weighting = weightTf))
+
+get_specific_emotion_score <- function(tf_dtm, emotion_words, emotion_name )
+{
+  emotion_scores=tm_term_score(tf_dtm, emotion_words)
+  emotion_scores_df <- tbl_df(emotion_scores) %>% rownames_to_column %>% rename(id = rowname) %>% rename(emotion = value) 
+  emotion_scores_df$id <- as.numeric(emotion_scores_df$id)
+  colnames(emotion_scores_df) <- c("id",emotion_name)
+  return(emotion_scores_df)
+}
+get_emotions_scores <- function(tf_dtm)
+{
+  pleasure_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("Pleasur") , "happy")
+  pain_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("Pain"), "sad")
+  feel_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("Feel"), "feel")
+  enlightened_scores_sf <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("EnlGain"), "enlightenment")
+  arousal_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("Arousal"), "arousal")
+  motivation_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("Means"), "motivation")
+  virtue_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("Virtue"), "virtue")
+  vice_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("Vice"), "vice")
+  general_emot_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("EMOT"), "general_emotion")
+  positive_emot_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("PosAff"), "pos_emotion")
+  negative_emot_scores_df <- get_specific_emotion_score(tf_dtm, terms_in_General_Inquirer_categories("NegAff"), "neg_emotion")
+  
+  emotions_scores_df <- list(general_emot_scores_df, positive_emot_scores_df, negative_emot_scores_df, pleasure_scores_df, pain_scores_df, feel_scores_df, enlightened_scores_sf, arousal_scores_df, motivation_scores_df, virtue_scores_df, vice_scores_df) %>% reduce(full_join, by = "id")
+  
+  return(emotions_scores_df)
+}
+
+emotions_scores_df <- get_emotions_scores(tf_dtm)
+emotions_scores_df <- dplyr::select(emotions_scores_df, -id)
+heatmap(as.matrix(emotions_scores_df), Rowv = NA, Colv = NA, cexCol=0.9, labRow=paste(""), col = colorRampPalette(brewer.pal(8, "Blues"))(20))
+```
+
+## Task #3 :Text Classification
+We perform a multi-class classification on the ratings on the talks to predict how the talks will likely to get what rating from the viewers. We can evaluate the model based on metrics such as micro and macro F1 and describe what are the common ratings that are misclassified in your model
+Notes:
+1. We will need to replace single quote with double for ratings column before using jsonlite to parse it.
+2. We use the rating with the highest count as the label for each talk. In other words, we are predicting a categorical variable, NOT a numerical variable such as average rating.
+```{r}
+#Find Main_Rating associated with each talk
+for (i in 1:nrow(ted_merged))
+{
+  df <- fromJSON(str_replace_all(ted_merged$rating[i],"'",'"'))
+  main_rating <- df[which.max(df$count), "name"]
+  ted_merged[i, "Main_Rating"] = main_rating
+}
+
+#Convert to document term matrix using TF-IDF weighting
+dtm_control <- list(weighting = function(x) weightTfIdf(x, normalize = FALSE))
+transcript_dtm <- DocumentTermMatrix(transcript_corpus, control = dtm_control)
+features_df <- tbl_df(as.matrix(transcript_dtm))
+nzv_columns <- nearZeroVar(features_df)
+features_df <- features_df[, -nzv_columns]
+
+#Split into training and test
+train_idx <- sample(nrow(features_df) * 0.7)
+train_features_df <- features_df[train_idx,]
+test_features_df <- features_df[-train_idx,]
+train_main_rating <- as.data.frame(ted_merged[train_idx,"Main_Rating"])
+colnames(train_main_rating) <- c("Main_Rating")
+test_main_rating <- as.data.frame(ted_merged[-train_idx,"Main_Rating"])
+colnames(test_main_rating) <- c("Main_Rating")
+
+#Using Random Forest Ranger - Faster implementation of RF
+ctrl <- trainControl(method = 'cv', number = 3,verboseIter = TRUE)
+rf_mod <- train(x = train_features_df, 
+                y = as.factor(train_main_rating$Main_Rating), 
+                method = "ranger",
+                trControl = ctrl,
+                tuneGrid = data.frame(mtry = floor(sqrt(dim(train_features_df)[2])),
+                                      splitrule = "gini",
+                                      min.node.size = 1))
+
+train_pred <- predict(rf_mod, train_features_df)
+test_pred <- predict(rf_mod, test_features_df)
+train_cm = as.matrix(table(Actual=train_main_rating$Main_Rating, Predicted=train_pred))
+train_cm
+cm = as.matrix(table(Actual=test_main_rating$Main_Rating, Predicted=test_pred))
+cm
+
+#macroF1
+n_instances = sum(cm)
+n_classes = nrow(cm) # number of classes
+correctlyClassified = diag(cm) # number of correctly classified instances per class 
+correctlyClassifiedTbl <- tbl_df(correctlyClassified) %>% rownames_to_column
+rowsums = apply(cm, 1, sum) # number of instances per class
+colsums = apply(cm, 2, sum) # number of predictions per class
+accuracy = sum(correctlyClassified) / n_instances 
+precision = correctlyClassified / colsums 
+recall = correctlyClassified / rowsums 
+f1 = 2 * precision * recall / (precision + recall) 
+macroPrecision = mean(na.exclude(precision))
+macroRecall = mean(recall)
+macroF1 = mean(na.exclude(f1))
+print(data.frame(unique(accuracy), macroPrecision, macroRecall, macroF1))
+  
+#oneVsAll matrix
+oneVsAll = lapply(1 : n_classes,
+                        function(i){
+                          v = c(cm[i,i],
+                                rowsums[i] - cm[i,i],
+                                colsums[i] - cm[i,i],
+                                n_instances-rowsums[i] - colsums[i] + cm[i,i]);
+                          return(matrix(v, nrow = 2, byrow = T))})
+
+#microF1
+s = matrix(0, nrow = 2, ncol = 2)
+for(i in 1 : n_classes){s = s + oneVsAll[[i]]}
+s
+avgAccuracy = sum(diag(s)) / sum(s)
+print(avgAccuracy)
+microF1 = (diag(s) / apply(s,1, sum))[1]
+microF1
+
+#Commonly misclassified ratings
+ratingToMisclassRate = data.frame(rating=sort(unique(test_main_rating$Main_Rating)))
+getMisClassRate = function(cm){
+  TP <- cm[2, 2]
+  TN <- cm[1, 1]
+  FP <- cm[2, 1]
+  FN <- cm[1, 2]
+  accuracy <- (TP + TN) / (TP + TN + FP + FN)
+  return(1-accuracy)
+}
+for(i in 1 : nrow(ratingToMisclassRate))
+{
+  ratingToMisclassRate[i,"misclass_rate"] <- getMisClassRate(oneVsAll[[i]])
+}
+ratingToMisclassRate <- ratingToMisclassRate[order(-ratingToMisclassRate$misclass_rate),]
+ratingToMisclassRate[1:3,]
+
+#Automatic way to get Micro F1
+classificationMetrics(test_main_rating$Main_Rating, test_pred)
+```
+
+## Task #4 : Topic Modelling
+We find the top 10 related talks given a specific talk. You can show a few that have similarity above 0.5. Besides that we should also show our methodology (quantitatively or qualitatively) to derive the optimal topic model and justify our judgement.
+```{r}
+#topic modelling
+dtm_control <- list(weighting = function(x) weightTf(x))
+train_dtm <- DocumentTermMatrix(transcript_corpus, control = dtm_control)
+train_dtm = removeSparseTerms(train_dtm, 0.90)  
+freq_terms <- findFreqTerms(train_dtm, lowfreq = 10)
+dtm_control$dictionary <- freq_terms
+train_dtm <- DocumentTermMatrix(transcript_corpus, control = dtm_control)
+rowTotals <- apply(train_dtm , 1, sum) #Find the sum of words in each Document
+train_dtm.new   <- train_dtm[rowTotals> 0, ] #remove all docs without atleast 10 frequent words
+
+#Tuning Topic Number using perplexity score
+train_idx <- sample(train_dtm.new$nrow * 0.9)
+
+train <- train_dtm.new[train_idx,]
+test <- train_dtm.new[-train_idx,]
+
+ks <- c(10, 20, 50, 100)
+# Use parSapply to pass in additional parameters to LDA
+models <- parSapply(cl = cl, ks,
+                    function(k, data) topicmodels::LDA(data, k = k, method = "Gibbs", control = list(iter = 100)),
+                    data = train)
+perplexities <- parSapply(cl = cl, models,
+                          function(m, data) topicmodels::perplexity(m, data, use_theta = TRUE, estimate_theta = TRUE),
+                          data = test)
+optimal_idx <- which.min(perplexities)
+
+metrics_df <- tbl_df(data.frame(k = ks, perplexity = perplexities))
+
+ggplot(metrics_df) + geom_line(aes(x = k, y = perplexity)) +
+  ggtitle("Finding optimal number of topics(Lower perplexity score is better)")
+
+#Per-topic-per-term probabilities, called  β(“beta”) : the model computes the probability of that term being generated from that topic
+pertopic_perterm_prob <- tidy(models[[optimal_idx]], matrix = "beta")
+
+#top 10 terms in each topic
+top_terms <- pertopic_perterm_prob %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms %>%
+  filter(topic <= 3) %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+pertalk_pertopic_prob <- tidy(models[[optimal_idx]], matrix = "gamma")
+
+top_topics_in_document <- pertalk_pertopic_prob %>%
+  group_by(document) %>%
+  top_n(10, gamma) %>%
+  ungroup() %>%
+  arrange(document, -gamma)
+top_topics_in_document #Document 1 is 10% topic 80, 6% topic 46 etc
+ 
+#Similarity between 2 documents based on document topic distribution
+pertalk_pertopic_prob$document <- as.numeric(pertalk_pertopic_prob$document)
+document_topic_distribution <- spread(pertalk_pertopic_prob, "topic", "gamma" )
+document_topic_distribution <- document_topic_distribution[,-1]
+topicSimilarityMatrix = sim2(x = as.matrix(document_topic_distribution), method = "cosine", norm = "l2")
+
+get_10_most_similar_talks_using_topic_model <- function(similarityMatrix, doc_id)
+{
+  all_doc_values <- as.data.frame(similarityMatrix[doc_id,])
+  colnames(all_doc_values) <- c("topic_similarity")
+  all_doc_values$id <- row.names(all_doc_values)
+  most_similar_values_df <- all_doc_values[order(-all_doc_values$topic_similarity)[1:11],]
+  most_similar_doc_rows <- filter(ted_merged, id %in% as.vector(most_similar_values_df$id) )
+  cat(paste(most_similar_doc_rows$title, "\t", most_similar_values_df$topic_similarity, collapse=",\n"))
+}
+ 
+#Test similarity on Training Data on Document 1 : Document Topic can be inferred from the cosine similarity of 1
+get_10_most_similar_talks_using_topic_model(topicSimilarityMatrix,1)
+
+#Test similarity on test data
+test.topics <- posterior(models[[optimal_idx]], test)
+testTopicSimilarityMatrix = sim2(x = as.matrix(test.topics[[2]]), method = "cosine", norm = "l2")
+get_10_most_similar_talks_using_topic_model(testTopicSimilarityMatrix,1)
+```
+## Task #4 : Cosine Similarity matrix using simple TF-IDF matrix- to show that using TF-IDF works better than TF
+```{r}
+#cosine similarity with tfidf
+get_10_most_similar_talks <- function(talk_id, similarityMatrix)
+{
+  all_doc_values <- similarityMatrix[talk_id,]
+  most_similar_values <- sort(all_doc_values,decreasing = TRUE)[2:11]
+  most_similar_values_df <- data.frame(id=names(most_similar_values),similar=most_similar_values)
+  most_similar_doc_rows <- filter(ted_merged, id %in% as.vector(most_similar_values_df$id) )
+  return(cat(paste(most_similar_doc_rows$title, collapse=",\n")))
+}
+
+it = itoken(ted_merged$transcript, progressbar = TRUE)
+v = create_vocabulary(it) %>% prune_vocabulary(doc_proportion_max = 0.1, term_count_min = 5)
+vectorizer = vocab_vectorizer(v)
+
+dtm = create_dtm(it, vectorizer)
+tfidf = TfIdf$new()
+dtm_tfidf = fit_transform(dtm, tfidf)
+d1_d2_tfidf_cos_sim = sim2(x = dtm_tfidf, method = "cosine", norm = "l2")
+dim(d1_d2_tfidf_cos_sim)
+
+#Test similarity
+i = 10
+print( ted_merged[i,"title"], max.levels=0)
+get_10_most_similar_talks(i,d1_d2_tfidf_cos_sim)
+```
+
+```{r}
+# Stop the cluster when finish with the process
+stopCluster(cl)
+```
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
